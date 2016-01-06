@@ -1,0 +1,114 @@
+---
+title: "A study of National Storm Data"
+output: html_document
+---
+
+### Synopsis
+Based on the U.S. National Oceanic and Atmospheric Administration's (NOAA) storm database, 
+we find out the types of event which are most harmful for population health, and
+which cause greatest economic consequences. 
+  
+  
+### Data Processing
+
+#### Read and Clean Data
+This storm data records the storm event in US ranging from 1950 to November 2011. It can be downloaded from [here](https://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2). Explanations of this data can be found in its [documentation](https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2Fpd01016005curr.pdf) and the [FAQ](https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2FNCDC%20Storm%20Events-FAQ%20Page.pdf). 
+
+It turns out the data file is quite large, reading in directly would take a large part of 
+memory. Besides, we only need the columns which describes the population health and 
+economic loss. Let's check the column names in this data set:
+```{r dataCheck, cache=TRUE}
+data_oneline = read.csv(bzfile("repdata-data-StormData.csv.bz2"),header=T,stringsAsFactors=F, nrow=1)
+print(colnames(data_oneline))
+```
+According the documentation, only the following columns are what we need:  
+1. `EVTYPE`: event type  
+2. `FATALITIES`: count of fatalities  
+3. `INJURIES`: count of injuries  
+4. `PROPDMG`: amount of property damage   
+5. `PROPDMGEXP`: exponent of property damage: k for 10^3, m for 10^6, b for 10^9  
+6. `CROPDMG`: amount of crop damage   
+7. `CROPDMGEXP`:  exponent of crop damage: k for 10^3, m for 10^6, b for 10^9
+
+Item 2, 3 are related to population health, while item 4~7 qualifies property damage.
+To address our problem, we only need to read in the above columns. This can be acheived
+by specifying `colClasses`. 
+```{r readData, cache=TRUE}
+library(knitr) # for r markdown execution
+library(data.table) # for easy data manipunation
+colClassNeeded = c(rep("NULL", 7), "character", 
+                   rep("NULL", 14), "numeric", "numeric",
+                   "numeric", "character",
+                   "numeric", "character",
+                   rep("NULL", 9))
+stormData = read.csv(bzfile("repdata-data-StormData.csv.bz2"),
+                     colClasses = colClassNeeded,
+                     header=T, stringsAsFactors=F)
+stormData_dt = data.table(stormData)
+rm(stormData) # clean to save memory
+```
+This procedure also drops all NAs, replacing them by blank `""`. We also need to combine the 
+number and the corresponding exponent for property
+damage and to clean the data.
+```{r cleanNAExponent, cache = TRUE}
+# take care of NAs and exponent for property damage
+stormData_dt$PROPDMGEXP[stormData_dt$PROPDMGEXP == ""]  = 1
+stormData_dt$PROPDMGEXP[stormData_dt$PROPDMGEXP == "K"] = 1e3
+stormData_dt$PROPDMGEXP[stormData_dt$PROPDMGEXP == "M"] = 1e6
+stormData_dt$PROPDMGEXP[stormData_dt$PROPDMGEXP == "B"] = 1e9
+stormData_dt$PROPDMGEXP = suppressWarnings(as.numeric(stormData_dt$PROPDMGEXP))
+# take care of NAs and exponent for crop damage
+stormData_dt$CROPDMGEXP[stormData_dt$CROPDMGEXP == ""]  = 1
+stormData_dt$CROPDMGEXP[stormData_dt$CROPDMGEXP == "K"] = 1e3
+stormData_dt$CROPDMGEXP[stormData_dt$CROPDMGEXP == "M"] = 1e6
+stormData_dt$CROPDMGEXP[stormData_dt$CROPDMGEXP == "B"] = 1e9
+stormData_dt$CROPDMGEXP = suppressWarnings(as.numeric(stormData_dt$CROPDMGEXP))
+```
+
+#### Process Data
+Now we start to process data. We realize that the population health is basically descibed
+by the total number of fatalities and injuries, so we sum these two up to create a new
+factor HEALTHLOSS; while the economic consequence is the sum of property damages and 
+crop damage, we sum these two damages up to a new column ECONOMICLOSS
+```{r combineAmount}
+stormData_dt$HEALTHLOSS   = stormData_dt$FATALITIES+stormData_dt$INJURIES
+stormData_dt$ECONOMICLOSS = stormData_dt$PROPDMG*stormData_dt$PROPDMGEXP + 
+                          stormData_dt$CROPDMG*stormData_dt$CROPDMGEXP
+```
+
+Now we are entitled to give the results to the two questions.
+
+  
+  
+### Results
+
+#### Most harmful event for population health
+We summarize the `HEALTHLOSS` data by event type do a bar plot to the top 10 events. Then we
+easily identify that **tornado** causes severest population health problem.
+```{r populationHealthPlot}
+healthRank = stormData_dt[, sum(HEALTHLOSS), by=EVTYPE]
+healthRank = healthRank[order(-V1)]
+healthRankTop10 = healthRank[1:10,]
+library(ggplot2)
+plot1 = ggplot(healthRankTop10, aes(x = EVTYPE, y=V1))
+plot1 + geom_bar(stat="identity",fill="red") +
+    xlab("Event Type") + ylab("Health Loss") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) # rotate x labels to accomodate more characters
+```
+
+
+##### Event causes the greatest economic consequences
+In a similar way, we summarise the `ECONOMICLOSS` data by event type, and do a bar plot to 
+the top 10 events:
+```{r EconomicDamagePlot}
+economicRank = stormData_dt[, sum(ECONOMICLOSS), by=EVTYPE]
+economicRank = economicRank[order(-V1)]
+economicRankTop10 = economicRank[1:10,]
+plot2 = ggplot(economicRankTop10, aes(x = EVTYPE, y=V1))
+plot2 + geom_bar(stat="identity",fill="red") +
+    xlab("Event Type") + ylab("Economic Loss") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1)) # rotate x labels to accomodate more characters
+```
+
+Obvisously,**flood** is the event which brings the largest economic 
+consequences.
