@@ -1,0 +1,7 @@
+base
+DBI
+dplyr
+ggplot2
+gridExtra
+knitr
+RSQLite

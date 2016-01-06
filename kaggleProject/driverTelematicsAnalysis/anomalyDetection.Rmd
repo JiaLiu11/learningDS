@@ -1,0 +1,266 @@
+---
+title: "Anomaly detection"
+author: "Jia Liu"
+date: "December 22, 2014"
+output: pdf_document
+---
+
+```{r overallSetting, echo=FALSE, warning=FALSE,message=FALSE}
+library(knitr)
+opts_chunk$set(echo=TRUE, 
+               message=FALSE,
+               warning=FALSE,
+               cache=F) # no code, no message from loading package
+opts_chunk$set(fig.width=4, fig.height=4)
+```
+
+```{r loadlibrary}
+# load necessary libraries
+library(RSQLite)
+library(dplyr)
+# for plotting
+library(ggplot2)
+library(gridExtra)
+library(GGally)
+```
+
+```{r initialization, echo=F}
+driver_id_now = 2L
+```
+
+
+### Abstract:
+Let's investigate if the tentative features have a Gaussian shape, or having a 
+Gaussian shape after a simple transformation. I will use the trips of driver 
+`r cat(driver_id_now)` to demonstrate this. 
+```{r loaddata}
+# connect to database using package 'dplyr'
+driver_db = src_sqlite(file.path('drivers_dbs', paste0(driver_id_now, '.db')))
+# link to data frame
+driver_sqlite=tbl(driver_db, "driver_data")
+# extract coordinates
+coord = collect(select(driver_sqlite, x, y, trip_id))
+# show some data
+head(coord)
+```
+
+**************************************
+
+### Possible Features
+Now we think about possible features of a dangerous driver, and then quantify them 
+use the data we have:
+
+ 1. High speed/acceleration  
+ 2. High speed or acceleration when turning  
+ 3. Long drive  
+ 4. Drive at night
+ 5. Hard breaks
+ 6. Drive in highway
+
+We can quantify them by:
+
+ 1. Mean speed/acceleration  
+ 2. High angular speed/acceleration  
+ 3. Total trip distance  
+ 4. No way to know...  
+ 5. Total counts of hard breaks per 10 miles. Progressive has a definition for hard 
+ break  
+ 6. Total time when speed is larger than 60mph
+
+The speed can be found by calculating numeric derivative: subtracting two consective 
+coordinates and divided by 1s. Acceleration is calculated by implementing numerical 
+derivative one step further. But in the post of Kaggle forum, the coordinate would 
+jump at times, which makes the numeric derivative infinite. In order to prevent the 
+large influence brought by these artificial large speed/acceleration, I will smooth it 
+by substituting any speed larger than 300 miles/hour (134.112m/s) by the mean of the 
+speed of the trip. In the function collection script `auxFunctions_AD.R`, I write a generic 
+function which can replace the "anomaly" high value by the group mean in one group.
+
+
+
+
+**********************
+### Find features 
+
+#### 1. Speed 
+
+The first step is to transform the Cartisan coordinates (x,y) to polar coordinate, 
+preparing to calculate speed and acceleration.
+```{r}
+# find the end point of each group
+temp = coord$trip_id
+temp = temp[-1]
+temp[length(temp)+1]=201
+# transform and create group end indicator
+coord = mutate(coord, r=sqrt(x**2+y**2), theta=atan2(y,x), group_end = temp-trip_id)
+rm(temp)
+```
+
+Now we calculate the speed by using the numerical derivative:
+$$
+v = \frac{r(t+\Delta t) - r(t)}{\Delta t}
+$$
+where $\Delta t$=1s because the time step between two GPS records is 1s. Following is 
+the code for calculating speed.
+
+```{r}
+# position of next time step
+r_after = coord$r[-1]
+r_after[nrow(coord)]=0
+coord = mutate(coord, speed = r_after-r)
+# fix the end point of each group
+coord[which(coord$group_end==1),"speed"]=0
+```
+
+In US, most of the car cannot has a speed larger than 300 miles/hour. Any speed beyond 
+that could be GPS error. So I set the threshold for infinity of speed to be 300 miles/hour, 
+or 134 m/s.
+```{r}
+source("auxFunctions_AD.R")
+coord = fixInfinityByMean(coord, "trip_id", "speed", 134)
+```
+
+Good news! GPS works fine for this driver's trips, no hyperspace jump!
+
+#### 2. Acceleration
+In a similar way as calculating speed, we calculate the acceleration. 
+
+$$
+a = \frac{v(t+\Delta t) - v(t)}{\Delta t}
+$$
+
+```{r}
+# position of next time step
+v_after = coord$speed[-1]
+v_after[nrow(coord)]=0
+coord = mutate(coord, acc = v_after-speed)
+# fix the end point of each group
+coord[which(coord$group_end==1),"acc"]=0
+```
+
+We also want to implement an infinity check for acceleration. Suppose the maximum 
+acceleration is 4s for 0-100mph ([ref])(http://www.zeroto60times.com/F1-0-60.html), i.e. 
+11$m/s^2$.
+```{r}
+coord = fixInfinityByMean(coord, "trip_id", "acc", 11)
+```
+
+#### 3. Angular speed and angular acceleration
+In the similar steps of finding and fixing infinity of linear speed/acceleration, we 
+calculate angular speed/acceleration, with the following assumption:
+ - Any car **CANNOT** make a U turn in 1 second.
+While I do not find such a limit for angular acceleration.
+
+
+```{r}
+# position of next time step
+theta_after = coord$theta[-1]
+theta_after[nrow(coord)]=0
+coord = mutate(coord, angular_speed = theta_after-theta)
+# fix the end point of each group
+coord[which(coord$group_end==1),"angular_speed"]=0
+# fix infinity: any car cannot make a U turn in 1 second
+coord = fixInfinityByMean(coord, "trip_id", "angular_speed", pi)
+```
+
+```{r}
+# position of next time step
+omega_after = coord$angular_speed[-1]
+omega_after[nrow(coord)]=0
+coord = mutate(coord, angular_acc = omega_after-angular_speed)
+# fix the end point of each group
+coord[which(coord$group_end==1),"angular_acc"]=0
+```
+
+#### 4. Counts of hard breaks
+Insurance company *Progressive* defines hard break as "any decerease in speed over 
+7 miles per second", i.e. smaller than -3.13$m/s^2$. We create an indicator feature 
+`hard_break` to flag out the acceleration smaller than this number for all the times.
+```{r}
+coord$hard_break = (coord$acc< -3.13)
+```
+
+#### 5. Time spent on highway
+Most of highway I drove before sets the speed limit to be equal or larger than 65 mph. 
+Counting how many seconds when speed is larger than 65 mph gives the time spent on highway. 
+I relax this speed limit to 60 for a little flexibility.
+
+```{r}
+coord$on_highway = coord$speed>26.8
+```
+
+
+### Summarize features in each group
+We will use mean speed, mean acceleration, mean angular speed, mean angular acceleration, 
+trip length and total number of hard breaks per 10 miles to represent the signatures 
+of each trip:
+```{r}
+trip_signature = coord %>% group_by(trip_id) %>%
+  summarise(mean_speed = mean(speed), mean_acc = mean(acc), 
+            mean_angular_speed=mean(angular_speed), mean_angular_acc=mean(angular_acc),
+            trip_length= sum(speed), hardBreaks_10M= sum(hard_break)/trip_length*10,
+            highway_time =sum(on_highway))
+```
+
+### Check the distribution of each feature
+In order to implement anomaly detection, we need to see if each feature is normally 
+distributed. Firstly we plot out the histograms of each feature:
+
+```{r, fig.height=8, fig.width=6, echo=F}
+p1 = ggplot(trip_signature, aes(x=mean_speed))+
+  geom_histogram(fill="red", color="black")+ggtitle("Mean Speed")
+p2 = ggplot(trip_signature, aes(x=mean_acc))+
+  geom_histogram(fill="red",color="black")+ggtitle("Mean Acceleration")
+p3 = ggplot(trip_signature, aes(x=mean_angular_speed))+
+  geom_histogram(fill="red",color="black")+ggtitle("Mean Angular Speed")
+p4 = ggplot(trip_signature, aes(x=mean_angular_acc))+
+  geom_histogram(fill="red",color="black")+ggtitle("Mean Angular Acceleration") 
+p5 = ggplot(trip_signature, aes(x=trip_length))+
+  geom_histogram(fill="red",color="black")+ggtitle("Trip Length")
+p6 = ggplot(trip_signature, aes(x=hardBreaks_10M))+
+  geom_histogram(fill="red",color="black")+ggtitle("# of hard breaks per 10 miles") 
+p7 = ggplot(trip_signature, aes(x=highway_time))+
+  geom_histogram(fill="red",color="black")+ggtitle("Time on highway") 
+grid.arrange(p1, p2, p3, p4, p5, p6, p7, ncol=2)
+```
+
+As shown above, mean speed, mean acceleration, trip length, number of hard breaks 
+per 10 miles, and time on highway are not normally distributed. However these  normally 
+quantities can be distributed in logarithmic scale, let's see:
+
+```{r, fig.height=6, fig.width=6, echo=F}
+p1 = ggplot(trip_signature, aes(x=log(abs(mean_speed))))+
+  geom_histogram(fill="red", color="black")+ggtitle("Mean Speed")
+p2 = ggplot(trip_signature, aes(x=log(abs(mean_acc))))+
+  geom_histogram(fill="red",color="black")+ggtitle("Mean Acceleration")
+p3 = ggplot(trip_signature, aes(x=log(trip_length)))+
+  geom_histogram(fill="red",color="black")+ggtitle("Trip Length")
+p4 = ggplot(trip_signature, aes(x=log(hardBreaks_10M)))+
+  geom_histogram(fill="red",color="black")+ggtitle("# of hard breaks per 10 miles") 
+p5 = ggplot(trip_signature, aes(x=log(highway_time)))+
+  geom_histogram(fill="red",color="black")+ggtitle("Time on high way") 
+grid.arrange(p1, p2, p3, p4, p5, ncol=2)
+```
+
+Now they look like normally distributed, and we can identify some outliers! These outlier 
+may belong to the trips which are not made by the current driver.
+
+Finally, we do a scatter matrix plot to visualize distribution of each 2 features.
+```{r, fig.height=8, fig.width=8}
+trip_signature_scaled = transmute(trip_signature, trip_id=trip_id,
+                               mean_v=log(abs(mean_speed)+1),
+                               mean_a=log(abs(mean_acc)+1),
+                               mean_w=mean_angular_speed,
+                               mean_al=mean_angular_acc,
+                               s = log(trip_length),
+                               breaks=log(hardBreaks_10M+1),
+                               h_time = log(highway_time))
+matrix_plot=ggpairs(trip_signature_scaled, columns=2:8,
+             upper = list(continuous="density"),
+             lower = list(continuous="smooth"),
+             diag  = list(continuous="density", discrete="bar"),
+        axisLabels='show')
+print(matrix_plot)
+```
+
+The density plots show the outliers clearly, especially for feature time in highway.

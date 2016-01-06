@@ -1,0 +1,339 @@
+---
+title: "Titanic Prediction Notes"
+author: "Jia Liu"
+date: "October 6, 2014"
+output: html_document
+---
+
+## Abstract
+In this document, we explore the performance of various statistical/machine learning 
+algorithm on Titanic data from [kaggle](https://www.kaggle.com/c/titanic-gettingStarted/data).
+
+
+```{r overallSetting, echo=FALSE, warning=FALSE,message=FALSE}
+library(knitr)
+opts_chunk$set(echo=FALSE, 
+               message=FALSE,
+               cache=TRUE) # no code, no message from loading package
+opts_chunk$set(fig.width=4, fig.height=4) # adjust the size of plots
+```
+
+
+## Explore data
+Firstly we need to load some functions to let the data manipulation easier.
+```{r initLibrary, echo=TRUE}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(gmodels) # for 2-way cross tabulation
+```
+
+Then we read in test data and explorer the possible connection between features of
+the passenger and their destiny.
+
+```{r loadin, echo=TRUE}
+titanic_train_data = fread("data/train.csv", na.strings="") # read as data.table
+```
+
+Then we take a quick look at the head of this data, see what is it like:
+```{r}
+head(titanic_train_data)
+```
+
+
+So we have **`r colnames(titanic_train_data)`** in the data set. **Survived** is what
+we need to predict, others are the features of each passenger. Kaggle gives explanation
+about the meaning of each feature:
+
+> survival: Survival  (0 = No; 1 = Yes)    
+> pclass  : Passenger Class (1 = 1st; 2 = 2nd; 3 = 3rd)  
+> name    : Name    
+> sex     : Sex    
+> age     : Age    
+> sibsp   : Number of Siblings/Spouses Aboard    
+> parch   : Number of Parents/Children Aboard    
+> ticket  : Ticket Number    
+> fare    : Passenger Fare    
+> cabin   : Cabin    
+> embarked: Port of Embarkation    
+>            (C = Cherbourg; Q = Queenstown; S = Southampton)  
+
+From all these features, name is unimportant. In other features, we would guess 
+"pclass", "sex", and "age" are strong indicators
+of survival: higher class may have priviledge to board the lifeboat; younger people has 
+higher chance to run to the lifeboat; and here is an old rule for boarding priority: "women
+and children first". So let's see if this is the case:
+```{r explore, echo=TRUE}
+# higher fare survives?
+ggplot(titanic_train_data, aes(factor(Survived), Fare))+
+  geom_boxplot()+xlab("Survived")
+# higher class survives?
+with(titanic_train_data, prop.table(table(Pclass, Survived)))
+# younger people survives?
+ggplot(titanic_train_data, aes(factor(Survived), Age))+
+  geom_boxplot()+xlab("Survived")
+# female survives?
+with(titanic_train_data, prop.table(table(Sex, Survived)))
+# higher fare associates with higher pclass
+ggplot(titanic_train_data, aes(factor(Pclass), Fare))+
+  geom_boxplot()+xlab("Pclass")
+```
+
+From above tables and plot, we clearly see that:  
+- People pays higher fare has higher survival chance;  
+- People at higher class has higher chance to survive;  
+- Age seems like not a good indicator for survival;   
+- Women has much higher survival rates than men;  
+- Fare associates with Pclass.
+
+Two big questions remains:  
+1. Does the Age~Survived plot really trustable, even it contains lots of missing data (
+`r sum(is.na(titanic_train_data$Age))` out of `r nrow(titanic_train_data)` rows)?  
+2. Other features are not important at all? From guts feeling, they are not.
+
+To answer these two question, we need to use statistical hypothesis test, if we accept all 
+the underlying distributions coming with these test. If we forgo these questions, we would
+better chose any algorithm containing regularization, to include these
+features while deal with possible overfitting. There are other problems we have to address: 
+are `Fare` and `Pclass` highly correlated, is there any interaction between features? 
+
+Before implementing any learning algorithem to this data, we have to clean them at first,
+realizing there are some nomial features, and `Age` information is highly incomplete.
+
+**********************************
+
+## Clean the data
+
+### Categorical/Nomial data:
+There are several nomial features, let's convert them to `factor` while keeping 
+their original values explicitly (otherwise R will use other `levels` to substitute
+these values):
+```{r, echo=TRUE}
+titanic_train_data$Survived = factor(titanic_train_data$Survived, 
+                                        levels=c(0, 1),
+                                        labels=c("0","1")) 
+titanic_train_data$Pclass   = factor(titanic_train_data$Pclass,
+                                        levels=c(1, 2, 3),
+                                        labels=c("1","2","3"))
+titanic_train_data$Sex      = factor(titanic_train_data$Sex, 
+                                     levels=c("female", "male"),
+                                     labels=c("0", "1"))# for easy interpretation
+titanic_train_data$Embarked = as.factor(titanic_train_data$Embarked)
+```
+
+#### *Aside: Naive logistic regression test*
+Let's press for a little bit, see what will come out if we do a "naive" logistic regression
+on the train data. Saying naive, I mean we only look at the complete cases (case with no missing value),
+and the interaction between features are simply ignored. 
+The purpose of this test is to see how the features associate with the outcome.
+```{r}
+titanic_train_complete = titanic_train_data[complete.cases(titanic_train_data),]
+titanic_naive_logit = glm(Survived~Pclass+Sex+Age+SibSp+Parch+Fare, 
+                          data=titanic_train_complete,
+                          family="binomial")
+summary(titanic_naive_logit)
+```
+From the wald test given by the summary, we see **Pclass, Sex, Age, SibSp** are statistically 
+significant in predicting survival, but how well this naive logistic model performes?
+```{r, echo=T}
+titanic_naive_logit_prediction = predict(titanic_naive_logit, type="response")
+titanic_naive_logit_prediction[titanic_naive_logit_prediction>0.5]=1
+titanic_naive_logit_prediction[titanic_naive_logit_prediction<=0.5]=0
+temp_table=table(pred=titanic_naive_logit_prediction, truth=titanic_train_complete$Survived)
+ftable(temp_table)
+```
+So there are `r temp_table[1,2]+temp_table[2,1]` out of `r sum(temp_table)` misclassified, or 
+`r sum(diag(temp_table))/sum(temp_table)*100`% passenger has been correctly classified. 
+
+This is not bad. But we see the effect of `Age` is significant, eventually we need the information
+of `Age` to make more stronger prediction. This means we need to impute `Age` seriously. We introduce
+the interaction between `Age` and `Sex`, and `Age` and `Pclass`, because there is a saying in kaggle
+that younger nobel women has very high survival rate.
+
+```{r}
+titanic_train_complete = mutate(titanic_train_complete, age.sex=interaction(Age, Sex))
+titanic_train_complete = mutate(titanic_train_complete, age.pclass=interaction(Age, Pclass))
+titanic_navie_logit_int = glm(Survived~Pclass+Sex+Age+SibSp+Parch+Fare+
+                                age.sex+age.pclass,
+                          data=titanic_train_complete,
+                          family="binomial")
+# summary(titanic_navie_logit_int) # this table is too long
+titanic_naive_logit_int_prediction = predict(titanic_navie_logit_int, type="response")
+titanic_naive_logit_int_prediction[titanic_naive_logit_int_prediction>0.5]=1
+titanic_naive_logit_int_prediction[titanic_naive_logit_int_prediction<=0.5]=0
+temp_table=table(pred=titanic_naive_logit_int_prediction, truth=titanic_train_complete$Survived)
+ftable(temp_table)
+```
+
+The fate of `r sum(diag(temp_table))/sum(temp_table)*100`% passenger has been correctly classified, 
+it is quite a bit improvement. But in this model, `glm` does not converge. We can try to use penalized glm
+to avoid this. Before digging deeper, let's see how does this naive logistic regression model perform 
+at prediction:
+```{r, echo=TRUE}
+titanic_test_data=fread("data/test.csv", na.strings="")
+# clean the data
+titanic_test_data$Pclass = factor(titanic_test_data$Pclass,
+                                        levels=c(1, 2, 3),
+                                        labels=c("1","2","3"))
+titanic_test_data$Sex = factor(titanic_test_data$Sex, 
+                                     levels=c("female", "male"),
+                                     labels=c("0", "1"))# for easy interpretation
+titanic_test_data_original = titanic_test_data
+# fill missing age with mean age
+titanic_test_data$Age[is.na(titanic_test_data$Age)]=mean(titanic_test_data$Age, na.rm=T)
+titanic_test_data$Fare[is.na(titanic_test_data$Fare)]=mean(titanic_test_data$Fare, na.rm=T)
+# fill in interaction
+titanic_pred = predict(titanic_naive_logit, 
+                                  newdata = titanic_test_data,
+                                  type="response")
+titanic_pred[titanic_pred<0.5]=0
+titanic_pred[titanic_pred>=0.5]=1
+titanic_test_data$Survived = titanic_pred
+write.csv(select(titanic_test_data, PassengerId, Survived),
+          file="prediction.csv",
+          row.names=FALSE)
+```
+
+Well, kaggle gives **0.75120**, not good at all.
+
+### Imputate data
+We are left with many NAs in this data set, let's see how many in them:
+```{r}
+sapply(titanic_train_data, function(x) sum(is.na(x)))
+```
+We have lost so much information in `Age`. I don't want to build my model on a wobbling
+brick, so I need to find a plausible way to imputate `Age`.
+
+I'll use R package `Amelia II` to do the imputation. This method requires multivariate
+normality and the missing at random assumption. These are satisfied in most cases.
+
+Besides, `Amelia` requires all information to be put into it, while eliminating factor input.
+```{r, echo=TRUE}
+library(Amelia)
+a.out = amelia(titanic_train_data, m=5, 
+               idvars = c(2, 3, 4, 5, 9,11,12)) # exclude factors, make 5 imputed datasets
+library(plyr)
+train_data_ameliaed = ldply(a.out$imputations) # combine all imputed datasets
+#train_data_ameliaed = a.out$imputations[[5]] # only use one imputed dataset
+# train all the data
+train_data_ameliaed_logit = glm(Survived~Pclass+Sex+Age+SibSp+Parch+Fare,
+                          data=train_data_ameliaed,
+                          family="binomial")
+train_data_ameliaed_pred = predict(train_data_ameliaed_logit, type="response")
+train_data_ameliaed_pred[train_data_ameliaed_pred<0.5]=0
+train_data_ameliaed_pred[train_data_ameliaed_pred>=0.5]=1
+temp_table = table(pred = train_data_ameliaed_pred, truth=train_data_ameliaed$Survived)
+prop.table(temp_table)
+```
+
+We have `r sum(diag(temp_table))/sum(temp_table)*100`% correctness.
+
+If we do not use `Amelia`, but use the "naive" model (missing ages equal to 
+mean age), to impute missing data, what would happen? Imputing data by the mean 
+can cause the result biased. For example, if younger people has higher chance to escape,
+imputing missing age by mean age would increase (low mean age) or decrease the survival
+rate for the people without age information. Let's see what will happen under this
+naive imputation method.
+```{r, echo=T}
+titanic_train_data_naiveImpute = titanic_train_data
+titanic_train_data_naiveImpute$Age[is.na(titanic_train_data_naiveImpute$Age)]=
+  mean(titanic_train_data_naiveImpute$Age,na.rm=T)
+train_data_logit_naiveImpute = glm(Survived~Pclass+Sex+Age+SibSp+Parch+Fare,
+                          data=titanic_train_data_naiveImpute,
+                          family="binomial")
+train_data_naiveImpute_pred = predict(train_data_logit_naiveImpute,
+                                            type="response")
+train_data_naiveImpute_pred[train_data_naiveImpute_pred<0.5]=0
+train_data_naiveImpute_pred[train_data_naiveImpute_pred>=0.5]=1
+temp_table = table(pred = train_data_naiveImpute_pred, 
+                   truth=titanic_train_data_naiveImpute$Survived)
+prop.table(temp_table)
+```
+
+This naive imputation gives `r sum(diag(temp_table))/sum(temp_table)*100`% correct
+classification, a little lower than the `Amelia` result. Let's see how `Amelia` helps
+to improve the kaggle score.
+```{r, echo=T}
+test_data_length=nrow(titanic_test_data_original)
+titanic_test_data_2 = titanic_test_data_original
+a.out2 = amelia(titanic_test_data_original, m=5, idvars=c(2, 3,4, 8, 10, 11))
+titanic_test_ameliaed = ldply(a.out2$imputations)
+# make prediction
+titanic_pred_5sets = predict(train_data_logit_naiveImpute, 
+                                  newdata = titanic_test_ameliaed,
+                                  type="response")
+titanic_pred_5sets[titanic_pred_5sets<0.5]=0
+titanic_pred_5sets[titanic_pred_5sets>=0.5]=1
+# since we used 5 imputed datasets, need to summarise to one final output
+idx_temp = rep(seq(1,test_data_length), 5)
+titanic_pred_dt = data.table(idx=idx_temp, pred=titanic_pred_5sets)
+titanic_pred = titanic_pred_dt[,lapply(.SD, sum), .SDcol="pred", by="idx"]
+titanic_pred = titanic_pred$pred
+titanic_pred[titanic_pred<=2]=0
+titanic_pred[titanic_pred>2]=1 # majority vote
+# write to file
+titanic_test_data_2$Survived = titanic_pred
+write.csv(select(titanic_test_data_2, PassengerId, Survived),
+          file="prediction_amelia.csv",
+          row.names=FALSE)
+```
+
+Kaggle gives **0.74163**, no much improvement after we implement `Amelia` to impute data.
+
+## Model Building
+
+### Penalized Logistic Regression
+
+
+### Support Vector Machine
+Support vector machine with a liner kernel applies to the case when the number of records is large (n=`r nrow(train_data_ameliaed)`)
+while the features is small (m=`r ncol(train_data_ameliaed)-2`), according to Andrew Ng's 
+*Machine Learning* course. The script please see 'titanic_svm.R'. It implements the `Amelia` to impute data, and use the majority vote to predict the final result. This would give similar results as logistic regression. The implementation only gets 0.71770 from kaggle. Not good at all!
+
+
+### Principle Component Analysis
+In the previous section, we have seen that some variables are correlated. So we
+don't really need all the variables. Doing a principle component analysis may help 
+us to reduce the total number of parameters and avoid the inclusion of repetitive variables.
+First we select all the numerical type columns:
+```{r, echo=TRUE}
+titanic_ameliaed_numericFeatures = select(train_data_ameliaed,
+                                        Pclass,Sex, Age,
+                                        SibSp,Parch,Fare)
+titanic_ameliaed_numericFeatures$Pclass = 
+  as.numeric(levels(titanic_ameliaed_numericFeatures$Pclass)[titanic_ameliaed_numericFeatures$Pclass])
+titanic_ameliaed_numericFeatures$Sex = 
+  as.numeric(levels(titanic_ameliaed_numericFeatures$Sex)[titanic_ameliaed_numericFeatures$Sex])
+titanic_ameliaed_outcome = select(train_data_ameliaed, Survived)
+# show correlation and covariance matrix
+train_corr = cor(titanic_ameliaed_numericFeatures)
+print(train_corr)
+train_cov  = cov(titanic_ameliaed_numericFeatures)
+print(train_cov)
+# show standard deviation
+train_sd = apply(titanic_ameliaed_numericFeatures, 2 ,sd)
+print(train_sd)
+```
+
+We observe that `Pclass` and `Fare` are negatively correlated, `Parch` and `SibSp` are 
+positively correlated. Also we notice the variance is quite different. Then we perform the PCA using the correlation matrix:
+```{r, echo=TRUE}
+pca_train = princomp(titanic_ameliaed_numericFeatures, cor=T)
+summary(pca_train)
+```
+From the above summary, we only need to choose the first 3 eigen-vectors, which will 
+explain 95% variance of the whole data. To see this more clearly, we make a plot to show this change of variance got explained by principle component more intuitively:
+
+```{r, echo=T}
+plot(pca_train, type = "l")
+```
+
+Then we choose the first three eigen-vectors as the new features to train support vector 
+machine and see what will happen:
+```{r, echo=TRUE}
+train_data_pcaed = loadings(pca_train)[,1:3]
+print(str(train_data_pcaed))
+summary(train_data_pcaed)
+str(eigen(train_corr)$vectors)
+```
+
